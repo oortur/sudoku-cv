@@ -1,41 +1,42 @@
+"""
+Choose picture of sudoku to get its filled solution!
+"""
+
+import sys
+from time import time
+from argparse import ArgumentParser
+
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
-
 import torch
 import torchvision
 import torchvision.transforms as transforms
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
+
+# numeric sudoku solver
+from sudokusolver import solve
+from model import MnistClassifier, MNIST_CELL_SIZE, DIGIT_CLASSIFIER_PATH
 
 
-DIGIT_CLASSIFIER_PATH = '/autograder/submission/mnist.model'
-# DIGIT_CLASSIFIER_PATH = './mnist.model'
-MNIST_CELL_SIZE = 28
+APP_NAME = "sudoku"
+SAMPLE_PATH = './images/image_0.jpg'
+DEFAULT_INPUT_PATH = './images/image_0.jpg'
+DEFAULT_OUTPUT_PATH = './images/solved_0.jpg'
 NORMAL_TABLE_SIZE = 1000
 BORDER_SIZE = 50
 
 
-class MnistClassifier(nn.Module):
-    def __init__(self):
-        super(MnistClassifier, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=20, 
-                               kernel_size=5, stride=1)
-        self.conv2 = nn.Conv2d(in_channels=20, out_channels=40, 
-                               kernel_size=5, stride=1)
-        self.fc1 = nn.Linear(in_features=640, out_features=200)
-        self.fc2 = nn.Linear(in_features=200, out_features=10)
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.max_pool2d(x, 2, 2)
-        x = F.relu(self.conv2(x))
-        x = F.max_pool2d(x, 2, 2)
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
+def load_digit_images(filepath):
+    global DIGITS
+    digit_model = MnistClassifier()
+    digit_model.load_state_dict(torch.load(DIGIT_CLASSIFIER_PATH))
+    digit_model.double()
+    digit_model.eval()
+    img = cv2.imread(filepath)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    _, tables, _ = search_tables(img)
+    _, DIGITS = search_digits(tables[0], digit_model, return_digit_images=True)
+    return
 
 
 def search_tables(img):
@@ -54,7 +55,8 @@ def search_tables(img):
             # filter points in sudoku tables to leave only 4 (?) that define a table
             epsilon = 0.01 * cv2.arcLength(contours[cnt_idx], True) 
             approx_table = cv2.approxPolyDP(contours[cnt_idx], epsilon, True)
-            sudoku_tables.append(approx_table)
+            if (len(approx_table) >= 4) and (len(approx_table) <= 8):
+                sudoku_tables.append(approx_table)
     
     # try to find a sudoku table once again
     if len(sudoku_tables) == 0:
@@ -107,7 +109,7 @@ def search_tables(img):
                                            (NORMAL_TABLE_SIZE + 2 * BORDER_SIZE, NORMAL_TABLE_SIZE + 2 * BORDER_SIZE))
         normal_tables.append(normal_table)
 
-    return mask, normal_tables
+    return mask, normal_tables, sudoku_tables
 
 
 def search_digits_bad_table(img_table):
@@ -152,7 +154,7 @@ def search_digits_good_table(img_table, cells):
             contours, hierarchy = cv2.findContours(np.uint8(img_cell * null_border_cell_10), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
             areas = [cv2.contourArea(cnt) for cnt in contours]
             digit_idx = np.argsort(areas)[-1]
-            y_min ,x_min, ww, hh = cv2.boundingRect(contours[digit_idx])
+            y_min, x_min, ww, hh = cv2.boundingRect(contours[digit_idx])
             step = 2
             img_cell = img_table[x - h // 2 + x_min - step : x - h // 2 + x_min + hh + step,
                                  y - h // 2 + y_min - step : y - h // 2 + y_min + ww + step]
@@ -164,7 +166,7 @@ def search_digits_good_table(img_table, cells):
     return digit_table
 
         
-def search_digits(img_table, digit_model):
+def search_digits(img_table, digit_model, return_digit_images=False):
     size = img_table.shape[0] - 2 * BORDER_SIZE
     # find big contours and filter them to leave sudoku only
     contours, hierarchy = cv2.findContours(img_table, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -190,6 +192,7 @@ def search_digits(img_table, digit_model):
         [transforms.ToTensor(),
          transforms.Normalize((0.5,), (0.5,))]
     )
+    digit_images = {}
     for i in range(9):
         for j in range(9):
             img_cell = digit_table[i][j]
@@ -203,22 +206,64 @@ def search_digits(img_table, digit_model):
                 preds_idx = np.argsort(preds)
                 if preds_idx[-1] == 5:
                     if preds[6] / preds[5] > 0.5:
-                        digit_table[i][j] = 6
-                        continue
+                        preds_idx[-1] = 6
                 if preds_idx[-1] == 7:
                     if preds[1] / preds[7] > 0.5:
-                        digit_table[i][j] = 1
-                        continue
+                        preds_idx[-1] = 1
+                digit_images[int(preds_idx[-1])] = digit_table[i][j]
                 digit_table[i][j] = preds_idx[-1]
-    
+
     digit_table = np.array(digit_table, dtype=np.int16)
     digit_table = np.where(digit_table == 0, 8, digit_table)
+    if return_digit_images:
+        return digit_table, digit_images
     return digit_table
 
 
-def predict_image(img):
+def print_solution_to_table(normal_table, digit_table):
+    sudoku_string = ''
+    for row in digit_table:
+        sudoku_row = ' '.join(map(str, row))
+        sudoku_string += '\n' + sudoku_row.replace('-1', '?')
+
+    # throws exception if unsolvable in case when the given table is broken
+    solved_table = next(solve(sudoku_string))
+    
+    size = normal_table.shape[0] - 2 * BORDER_SIZE
+    h = size // 10
+    step = size // 100
+    for i in range(9):
+        for j in range(9):
+            if digit_table[i][j] == -1:
+                solution = DIGITS[solved_table[i][j]]
+                solution = cv2.resize(solution, (h - 2 * step, h - 2 * step), interpolation=cv2.INTER_AREA)
+                x = step * (i + 1) + h * i + BORDER_SIZE + step // 2
+                y = step * (j + 1) + h * j + BORDER_SIZE + step // 2
+                normal_table[x : x + h - 2 * step, y : y + h - 2 * step] = solution
+    return normal_table
+        
+
+def draw_solution(img, normal_tables, initial_points, mask):
+    normal_points = np.float32([[0, 0],
+                                [0, NORMAL_TABLE_SIZE],
+                                [NORMAL_TABLE_SIZE, 0], 
+                                [NORMAL_TABLE_SIZE, NORMAL_TABLE_SIZE]])
+    for k in range(len(normal_points)):
+        normal_points[k] = [normal_points[k][0] + BORDER_SIZE, normal_points[k][1] + BORDER_SIZE]
+    result = img.copy()
+    for k in range(len(normal_tables)):
+        transform = cv2.getPerspectiveTransform(normal_points, np.float32(initial_points[k]))
+        initial_table = cv2.warpPerspective(normal_tables[k], transform, img.shape[::-1])
+        result = (result - (initial_table - initial_table.min()) * mask).clip(min=0)
+    # make black pixels a bit brighter
+    result[result < 10] = np.random.randint(30, 40, size=result.shape)[result < 10]
+    result = np.uint8(result)
+    return result
+
+    
+def draw(img, filepath):
     img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    mask, normal_tables = search_tables(img)
+    mask, normal_tables, initial_points = search_tables(img)
     
     digit_model = MnistClassifier()
     digit_model.load_state_dict(torch.load(DIGIT_CLASSIFIER_PATH))
@@ -226,8 +271,65 @@ def predict_image(img):
     digit_model.eval()
     
     digits = []
-    for normal_table in normal_tables:
+    for k, normal_table in enumerate(normal_tables):
         digit_table = search_digits(normal_table, digit_model)
+        try:
+            normal_table = print_solution_to_table(normal_table, digit_table)
+        except:
+            print('Sudoku is unsolvable: unable to detect digits correctly.', file=sys.stderr)
+            return
         digits.append(digit_table)
+        normal_tables[k] = normal_table
         
-    return mask, digits
+    result = draw_solution(img, normal_tables, initial_points, mask)
+    result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
+    # plt.figure(dpi=150)
+    # plt.imshow(img, cmap='gray');
+    # plt.figure(dpi=150)
+    # plt.imshow(result, cmap='gray');
+    cv2.imwrite(filepath, result)
+    return result
+
+
+DIGITS = {}
+load_digit_images(SAMPLE_PATH)
+
+
+def callback(arguments):
+    """Callback function to process CLI commands"""
+    start = time()
+    image = cv2.imread(arguments.input)
+    try:
+        draw(image, arguments.output)
+    except Exception as e:
+        print(e)
+    print(f"Running time: {time() - start:.3f} seconds.")
+
+
+def setup_parser(parser):
+    """Parse commands from CLI"""
+    parser.add_argument(
+        "-i", "--input",
+        default=DEFAULT_INPUT_PATH,
+        help="path to input image",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default=DEFAULT_OUTPUT_PATH,
+        help="path to output image",
+    )
+    parser.set_defaults(callback=callback)
+
+
+def main():
+    parser = ArgumentParser(
+        prog=APP_NAME,
+        description="make a photo of sudoku and get filled solution",
+    )
+    setup_parser(parser)
+    arguments = parser.parse_args()
+    arguments.callback(arguments)
+
+
+if __name__ == "__main__":
+    main()

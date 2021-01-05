@@ -1,3 +1,6 @@
+"""This code for string based sudoku solver is taken from https://github.com/maxme1/sudoku"""
+
+
 from itertools import islice
 from typing import Iterable, Union, Tuple
 
